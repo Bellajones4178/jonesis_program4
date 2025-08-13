@@ -6,12 +6,13 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 
-// read a file into a string (strip newline)
+// read a file into a string
 void readFile(char *filename, char *buf) {
     FILE *fp = fopen(filename, "r");
     if (!fp) { fprintf(stderr, "Error: cannot open %s\n", filename); exit(1); }
-    fgets(buf, 150000, fp);
+    if (!fgets(buf, 150000, fp)) { buf[0] = '\0'; }
     buf[strcspn(buf, "\n")] = '\0';
     fclose(fp);
 }
@@ -26,11 +27,31 @@ void validateText(const char *txt) {
     }
 }
 
+// shove all bytes out the door (send() can short-write)
+void sendAll(int sockFD, const char *buf, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = send(sockFD, buf + sent, len - sent, 0);
+        if (n < 0) { perror("send"); exit(1); }
+        sent += n;
+    }
+}
+
+// pull exactly len bytes (recv() can short-read)
+void recvAll(int sockFD, char *buf, int len) {
+    int got = 0;
+    while (got < len) {
+        int n = recv(sockFD, buf + got, len - got, 0);
+        if (n <= 0) { perror("recv"); exit(1); }
+        got += n;
+    }
+}
+
 int main(int argc, char *argv[]) {
     int sockFD, portNum;
     struct sockaddr_in servAddr;
     struct hostent* serverInfo;
-    char msg[150000], key[150000], buffer[150000];
+    char msg[150000], key[150000], buffer[16];
 
     if (argc < 4) {
         fprintf(stderr,"USAGE: %s plaintext key port\n", argv[0]);
@@ -45,7 +66,7 @@ int main(int argc, char *argv[]) {
     validateText(key);
 
     // Check for length
-    if (strlen(key) < strlen(msg)) {
+    if ((int)strlen(key) < (int)strlen(msg)) {
         fprintf(stderr, "Error: key '%s' is too short\n", argv[2]);
         exit(1);
     }
@@ -69,21 +90,38 @@ int main(int argc, char *argv[]) {
         exit(2);
     }
 
-    send(sockFD, "ENC", 3, 0);
-    memset(buffer, '\0', sizeof(buffer));
-    recv(sockFD, buffer, sizeof(buffer) - 1, 0);
-    if (strcmp(buffer, "OK") != 0) {
+    // say who we are, expect "OK" back
+    sendAll(sockFD, "ENC", 3);
+    memset(buffer, 0, sizeof(buffer));
+    int n = recv(sockFD, buffer, sizeof(buffer)-1, 0);
+    if (n <= 0 || strcmp(buffer, "OK") != 0) {
         fprintf(stderr, "Error: could not contact enc_server on port %d\n", portNum);
         close(sockFD);
         exit(2);
     }
 
-    send(sockFD, msg, strlen(msg), 0);
-    send(sockFD, key, strlen(key), 0);
-    memset(buffer, '\0', sizeof(buffer));
-    recv(sockFD, buffer, sizeof(buffer) - 1, 0);
-    printf("%s\n", buffer);
+    // send lengths first so server knows what’s coming
+    int msgLen = (int)strlen(msg);
+    int keyLen = (int)strlen(key);
+    int netMsgLen = htonl(msgLen);
+    int netKeyLen = htonl(keyLen);
+    sendAll(sockFD, (char*)&netMsgLen, sizeof(netMsgLen));
+    sendAll(sockFD, (char*)&netKeyLen, sizeof(netKeyLen));
 
+    // now send the actual text blobs
+    sendAll(sockFD, msg, msgLen);
+    sendAll(sockFD, key, keyLen);
+
+    // get back the ciphertext (same length as plaintext)
+    char *cipher = (char*)malloc(msgLen + 1);
+    if (!cipher) { fprintf(stderr, "Error: out of memory\n"); close(sockFD); exit(1); }
+    recvAll(sockFD, cipher, msgLen);
+    cipher[msgLen] = '\0';
+
+    // print to stdout (with newline per assignment)
+    printf("%s\n", cipher);
+
+    free(cipher);
     close(sockFD);
     return 0;
 }
